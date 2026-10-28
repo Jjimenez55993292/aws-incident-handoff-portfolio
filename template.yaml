@@ -1,0 +1,276 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Final Portfolio: Incident Handoff Tracker (API Gateway, Lambda, DynamoDB, S3, CloudWatch)'
+
+Parameters:
+  StudentName:
+    Type: String
+    Default: Jacinto Jimenez
+    MinLength: 1
+    MaxLength: 80
+    Description: Name shown on the health-check endpoint for portfolio evidence
+
+Resources:
+  IncidentTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: incidentId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: incidentId
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: AWS-Portfolio
+
+  ArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DemoArchiveRetention
+            Status: Enabled
+            ExpirationInDays: 7
+            Prefix: incidents/
+      Tags:
+        - Key: Project
+          Value: AWS-Portfolio
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-handler'
+      RetentionInDays: 7
+
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: IncidentDataOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt IncidentTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub '${ArchiveBucket.Arn}/incidents/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-handler:*'
+
+  IncidentHandler:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-handler'
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 10
+      Role: !GetAtt AppRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref IncidentTable
+          ARCHIVE_BUCKET: !Ref ArchiveBucket
+          STUDENT_NAME: !Ref StudentName
+      Code:
+        ZipFile: |
+          """Minimal demo API for fictional support handoff records.
+
+          GET /health is public. GET/POST /incidents use API Gateway AWS_IAM auth.
+          No real customer data should be submitted to this portfolio application.
+          """
+          import base64
+          import json
+          import os
+          import uuid
+          from datetime import datetime, timezone
+
+          import boto3
+
+
+          def respond(status, payload):
+              return {
+                  "statusCode": status,
+                  "headers": {"content-type": "application/json", "cache-control": "no-store"},
+                  "body": json.dumps(payload),
+              }
+
+
+          def handler(event, context):
+              req = (event.get("requestContext") or {}).get("http") or {}
+              method = req.get("method") or event.get("httpMethod") or ""
+              path = event.get("rawPath") or event.get("path") or ""
+              student = os.environ["STUDENT_NAME"]
+
+              if method == "GET" and path == "/health":
+                  return respond(200, {
+                      "status": "ok", "project": "Incident Handoff Tracker",
+                      "student": student, "region": os.environ["AWS_REGION"],
+                  })
+
+              if method == "POST" and path == "/incidents":
+                  try:
+                      raw = event.get("body") or "{}"
+                      if event.get("isBase64Encoded"):
+                          raw = base64.b64decode(raw).decode("utf-8")
+                      data = json.loads(raw)
+                      if not isinstance(data, dict):
+                          raise ValueError("Object expected")
+                  except (ValueError, TypeError, UnicodeDecodeError):
+                      return respond(400, {"error": "Invalid JSON object"})
+                  title = data.get("title")
+                  summary = data.get("summary", "")
+                  severity = data.get("severity", "LOW")
+                  if not (isinstance(title, str) and 1 <= len(title.strip()) <= 120
+                          and isinstance(summary, str) and len(summary) <= 500
+                          and severity in ("LOW", "MEDIUM", "HIGH")):
+                      return respond(400, {"error": "Provide title (1-120), summary (max 500), severity LOW/MEDIUM/HIGH"})
+
+                  incident_id = str(uuid.uuid4())
+                  item = {
+                      "incidentId": incident_id,
+                      "title": title.strip(),
+                      "summary": summary,
+                      "severity": severity,
+                      "createdAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                      "student": student,
+                  }
+                  table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
+                  table.put_item(Item=item)
+                  boto3.client("s3").put_object(
+                      Bucket=os.environ["ARCHIVE_BUCKET"],
+                      Key=f"incidents/{incident_id}.json",
+                      Body=json.dumps(item).encode("utf-8"),
+                      ContentType="application/json",
+                      ServerSideEncryption="AES256",
+                  )
+                  print("Created demo record", incident_id)
+                  return respond(201, item)
+
+              if method == "GET" and path.startswith("/incidents/"):
+                  incident_id = path.rsplit("/", 1)[-1]
+                  try:
+                      uuid.UUID(incident_id)
+                  except ValueError:
+                      return respond(400, {"error": "Invalid incident ID"})
+                  table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
+                  record = table.get_item(Key={"incidentId": incident_id}).get("Item")
+                  return respond(200, record) if record else respond(404, {"error": "Not found"})
+
+              return respond(404, {"error": "Route not found"})
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      ProtocolType: HTTP
+      Description: 'Public GET /health and IAM-protected incident routes'
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt IncidentHandler.Arn
+      PayloadFormatVersion: '2.0'
+
+  HealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /health'
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  CreateIncidentRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /incidents'
+      AuthorizationType: AWS_IAM
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  ReadIncidentRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /incidents/{incidentId}'
+      AuthorizationType: AWS_IAM
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 2
+        ThrottlingBurstLimit: 5
+
+  AllowApiInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref IncidentHandler
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*'
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: 'Portfolio demo: trigger when Lambda errors occur during a 5-minute period'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IncidentHandler
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ApiBaseURL:
+    Description: API Gateway HTTPS base URL
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+  HealthURL:
+    Description: Public endpoint; shows student name for assessment evidence
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/health'
+  IncidentTableName:
+    Value: !Ref IncidentTable
+  ArchiveBucketName:
+    Value: !Ref ArchiveBucket
+  LambdaFunctionName:
+    Value: !Ref IncidentHandler
+  AlarmName:
+    Value: !Ref LambdaErrorAlarm

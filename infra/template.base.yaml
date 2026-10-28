@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Final Portfolio: Incident Handoff Tracker (API Gateway, Lambda, DynamoDB, S3, CloudWatch)'
+
+Parameters:
+  StudentName:
+    Type: String
+    Default: Jacinto Jimenez
+    MinLength: 1
+    MaxLength: 80
+    Description: Name shown on the health-check endpoint for portfolio evidence
+
+Resources:
+  IncidentTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: incidentId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: incidentId
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: AWS-Portfolio
+
+  ArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DemoArchiveRetention
+            Status: Enabled
+            ExpirationInDays: 7
+            Prefix: incidents/
+      Tags:
+        - Key: Project
+          Value: AWS-Portfolio
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-handler'
+      RetentionInDays: 7
+
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: IncidentDataOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt IncidentTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub '${ArchiveBucket.Arn}/incidents/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-handler:*'
+
+  IncidentHandler:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-handler'
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 10
+      Role: !GetAtt AppRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref IncidentTable
+          ARCHIVE_BUCKET: !Ref ArchiveBucket
+          STUDENT_NAME: !Ref StudentName
+      Code:
+        ZipFile: |
+          __PYTHON_CODE__
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      ProtocolType: HTTP
+      Description: 'Public GET /health and IAM-protected incident routes'
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt IncidentHandler.Arn
+      PayloadFormatVersion: '2.0'
+
+  HealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /health'
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  CreateIncidentRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /incidents'
+      AuthorizationType: AWS_IAM
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  ReadIncidentRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /incidents/{incidentId}'
+      AuthorizationType: AWS_IAM
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 2
+        ThrottlingBurstLimit: 5
+
+  AllowApiInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref IncidentHandler
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*'
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: 'Portfolio demo: trigger when Lambda errors occur during a 5-minute period'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IncidentHandler
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ApiBaseURL:
+    Description: API Gateway HTTPS base URL
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+  HealthURL:
+    Description: Public endpoint; shows student name for assessment evidence
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/health'
+  IncidentTableName:
+    Value: !Ref IncidentTable
+  ArchiveBucketName:
+    Value: !Ref ArchiveBucket
+  LambdaFunctionName:
+    Value: !Ref IncidentHandler
+  AlarmName:
+    Value: !Ref LambdaErrorAlarm
